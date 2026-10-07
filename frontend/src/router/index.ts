@@ -32,6 +32,24 @@ const routes: RouteRecordRaw[] = [
     meta: { title: '流速测点录入', icon: 'DataLine' }
   },
   {
+    path: '/stations/:id/surveys',
+    name: 'survey-board',
+    component: () => import('@/pages/SurveyBoard.vue'),
+    meta: { title: '大断面成果', icon: 'Aim' }
+  },
+  {
+    path: '/sections/:id/scour',
+    name: 'scour-board',
+    component: () => import('@/pages/ScourBoard.vue'),
+    meta: { title: '汛后冲淤对账', icon: 'Connection' }
+  },
+  {
+    path: '/scour-pending',
+    name: 'scour-pending',
+    component: () => import('@/pages/ScourPending.vue'),
+    meta: { title: '待挂成果队列', icon: 'Connection' }
+  },
+  {
     path: '/ratings',
     name: 'rating-chart',
     component: () => import('@/pages/RatingChart.vue'),

@@ -10,6 +10,7 @@ import { createEmptySectionFilter, type SectionFilterState } from '@/types/secti
 import type { Vertical } from '@/types/vertical'
 import { buildRelativeDepths } from '@/types/vertical'
 import type { Point } from '@/types/point'
+import { useScourStore } from '@/stores/scourStore'
 
 /** 垂线录入草稿（新增/编辑表单共享结构） */
 export interface VerticalDraft {
@@ -184,20 +185,32 @@ export const useSectionStore = defineStore('section', () => {
     const now = Date.now()
     const row: Section = { ...payload, id: createId('sec'), createdAt: now, updatedAt: now }
     await db.sections.put(row)
+    // 新测次先在流量测验组侧登记一条待挂记录，等待挂上当时生效的成果
+    await useScourStore().ensureLinkForSection(row)
     return row
   }
 
   async function updateSection(id: string, patch: Partial<Section>): Promise<void> {
+    const previous = sections.value.find((section) => section.id === id)
     await db.sections.update(id, { ...patch, updatedAt: Date.now() } as never)
+    // 测次时间一改动成果就对不上：挂靠作废退回待挂，由流量测验组本侧重挂（测量组那份不动）
+    if (
+      typeof patch.measuredAt === 'string' &&
+      previous &&
+      Date.parse(patch.measuredAt) !== Date.parse(previous.measuredAt)
+    ) {
+      await useScourStore().detachSection(id)
+    }
   }
 
   async function removeSection(id: string): Promise<void> {
-    await db.transaction('rw', [db.sections, db.verticals, db.points], async () => {
+    await db.transaction('rw', [db.sections, db.verticals, db.points, db.scourLinks], async () => {
       const verticalIds = (await db.verticals.where('sectionId').equals(id).toArray()).map((row) => row.id)
       if (verticalIds.length > 0) {
         await db.points.where('verticalId').anyOf(verticalIds).delete()
         await db.verticals.bulkDelete(verticalIds)
       }
+      await db.scourLinks.where('sectionId').equals(id).delete()
       await db.sections.delete(id)
     })
   }
@@ -224,18 +237,23 @@ export const useSectionStore = defineStore('section', () => {
       updatedAt: now + index
     }))
     if (pointRows.length > 0) await db.points.bulkPut(pointRows)
+    useScourStore().scheduleRecompute(sectionId)
     return row
   }
 
   async function updateVertical(id: string, patch: Partial<Vertical>): Promise<void> {
     await db.verticals.update(id, { ...patch, updatedAt: Date.now() } as never)
+    const vertical = verticals.value.find((item) => item.id === id)
+    if (vertical) useScourStore().scheduleRecompute(vertical.sectionId)
   }
 
   async function removeVertical(id: string): Promise<void> {
+    const vertical = verticals.value.find((item) => item.id === id)
     await db.transaction('rw', [db.verticals, db.points], async () => {
       await db.points.where('verticalId').equals(id).delete()
       await db.verticals.delete(id)
     })
+    if (vertical) useScourStore().scheduleRecompute(vertical.sectionId)
   }
 
   /** 按测点数重排该垂线的测点行（保持已有流速值，缺失的补默认） */
@@ -256,11 +274,13 @@ export const useSectionStore = defineStore('section', () => {
         updatedAt: now + index
       }
     })
+    const vertical = verticals.value.find((item) => item.id === verticalId)
     await db.transaction('rw', [db.verticals, db.points], async () => {
       await db.points.where('verticalId').equals(verticalId).delete()
       if (rows.length > 0) await db.points.bulkPut(rows)
       await db.verticals.update(verticalId, { pointCount: rows.length, updatedAt: now } as never)
     })
+    if (vertical) useScourStore().scheduleRecompute(vertical.sectionId)
     return rows.length
   }
 
@@ -274,17 +294,29 @@ export const useSectionStore = defineStore('section', () => {
     const row: Point = { ...payload, verticalId, id: createId('pnt'), createdAt: now, updatedAt: now }
     await db.points.put(row)
     await syncVerticalPointCount(verticalId)
+    scheduleRecomputeOfVertical(verticalId)
     return row
   }
 
   async function updatePoint(id: string, patch: Partial<Point>): Promise<void> {
     await db.points.update(id, { ...patch, updatedAt: Date.now() } as never)
+    const point = points.value.find((item) => item.id === id)
+    if (point) scheduleRecomputeOfVertical(point.verticalId)
   }
 
   async function removePoint(id: string): Promise<void> {
     const point = points.value.find((item) => item.id === id)
     await db.points.delete(id)
-    if (point) await syncVerticalPointCount(point.verticalId)
+    if (point) {
+      await syncVerticalPointCount(point.verticalId)
+      scheduleRecomputeOfVertical(point.verticalId)
+    }
+  }
+
+  /** 由垂线 id 找到所属测次并去抖重算冲淤对账 */
+  function scheduleRecomputeOfVertical(verticalId: string): void {
+    const vertical = verticals.value.find((item) => item.id === verticalId)
+    if (vertical) useScourStore().scheduleRecompute(vertical.sectionId)
   }
 
   /** 批量改写某垂线全部测点流速（批量录入） */
@@ -297,6 +329,7 @@ export const useSectionStore = defineStore('section', () => {
         point.velocityMs = velocityMs
         point.updatedAt = now
       })
+    scheduleRecomputeOfVertical(verticalId)
     return pointsOfVertical(verticalId).length
   }
 
@@ -321,6 +354,7 @@ export const useSectionStore = defineStore('section', () => {
       await db.points.bulkPut(records)
       await db.verticals.update(verticalId, { pointCount: records.length, updatedAt: now } as never)
     })
+    scheduleRecomputeOfVertical(verticalId)
     return records.length
   }
 
@@ -335,6 +369,7 @@ export const useSectionStore = defineStore('section', () => {
     if (rows.length === 0) return 0
     const weight = Number((1 / rows.length).toFixed(4))
     await db.points.bulkPut(rows.map((row) => ({ ...row, weight, updatedAt: Date.now() })))
+    scheduleRecomputeOfVertical(verticalId)
     return rows.length
   }
 

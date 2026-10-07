@@ -7,12 +7,14 @@
 import { computed, onMounted, reactive, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Delete, Edit, Plus, Refresh, Right, Warning } from '@element-plus/icons-vue'
+import { Delete, Edit, Plus, Refresh, Right, Warning, Connection } from '@element-plus/icons-vue'
 import StatBadge from '@/components/common/StatBadge.vue'
 import EmptyPanel from '@/components/common/EmptyPanel.vue'
 import RouteMissingPanel from '@/components/common/RouteMissingPanel.vue'
+import ScourStatusTag from '@/components/common/ScourStatusTag.vue'
 import { useStationStore } from '@/stores/stationStore'
 import { useSectionStore } from '@/stores/sectionStore'
+import { useScourStore } from '@/stores/scourStore'
 import { buildRelativeDepths, type Vertical } from '@/types/vertical'
 import { calcMeanVelocity, calcSectionDischarge } from '@/utils/flow'
 import { initDatabase } from '@/utils/db'
@@ -21,6 +23,7 @@ const route = useRoute()
 const router = useRouter()
 const stationStore = useStationStore()
 const sectionStore = useSectionStore()
+const scourStore = useScourStore()
 
 const sectionId = computed(() => String(route.params.id ?? ''))
 const section = computed(() => sectionStore.sectionById(sectionId.value))
@@ -39,6 +42,7 @@ const form = reactive({
 
 const verticals = computed(() => sectionStore.verticalsOfSection(sectionId.value))
 const conflicts = computed(() => (section.value ? sectionStore.findDistanceConflicts(sectionId.value) : []))
+const scourLink = computed(() => scourStore.linkOfSection(sectionId.value))
 
 /** 每条垂线的平均流速（按测点权重加权）与单宽流量 */
 const verticalRows = computed(() =>
@@ -170,6 +174,10 @@ function gotoPoints(vertical: Vertical): void {
   void router.push(`/verticals/${vertical.id}/points`)
 }
 
+function gotoScour(): void {
+  void router.push(`/sections/${sectionId.value}/scour`)
+}
+
 onMounted(() => {
   if (stationStore.stations.length === 0) void initDatabase()
   sectionStore.selectSection(sectionId.value)
@@ -216,7 +224,10 @@ onMounted(() => {
             录入起点距与水深，测点数决定按相对水深自动生成的测点行（1/2/3/5 点法有预设分布）。垂线按起点距升序参与流量计算。
           </p>
         </div>
-        <el-button type="primary" :icon="Plus" @click="openCreate">新增垂线</el-button>
+        <div class="page__head-actions">
+          <el-button type="warning" plain :icon="Connection" @click="gotoScour">汛后冲淤对账</el-button>
+          <el-button type="primary" :icon="Plus" @click="openCreate">新增垂线</el-button>
+        </div>
       </div>
 
       <div class="gb-stats-row">
@@ -233,6 +244,26 @@ onMounted(() => {
         :closable="false"
         :title="`起点距排序校验未通过：垂线 ${conflicts.join('、')} 的起点距与其他垂线重复，请调整后再参与流量计算`"
       />
+
+      <el-alert
+        v-if="scourLink"
+        :type="scourLink.linkStatus === '待挂' ? 'warning' : scourLink.deviationCount > 0 ? 'error' : 'success'"
+        show-icon
+        :closable="false"
+        class="page__scour-alert"
+      >
+        <template #title>
+          <div class="page__scour-line">
+            <ScourStatusTag
+              :link-status="scourLink.linkStatus"
+              :deviation-count="scourLink.deviationCount"
+              show-text
+            />
+            <span>{{ scourLink.conclusion }}</span>
+            <el-button size="small" text type="primary" :icon="Right" @click="gotoScour">查看逐条对账</el-button>
+          </div>
+        </template>
+      </el-alert>
 
       <EmptyPanel
         v-if="verticalRows.length === 0"
@@ -379,6 +410,23 @@ onMounted(() => {
   margin-left: 8px;
   font-size: 12px;
   color: #8194a2;
+}
+
+.page__head-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.page__scour-alert :deep(.el-alert__content) {
+  flex: 1;
+}
+
+.page__scour-line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
 }
 
 .page__warn {

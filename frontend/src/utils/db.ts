@@ -2,7 +2,8 @@
  * IndexedDB 持久化层（Dexie 封装）
  * - 库名 gbhydrogaug，含数据结构版本号与升级迁移逻辑
  * - 升级时按 version().stores() 补齐索引
- * - 首次打开自动播种互相引用的演示数据（测站 → 断面 → 垂线 → 测点 → 点据 → 比测）
+ * - 首次打开自动播种互相引用的演示数据（测站 → 断面 → 垂线 → 测点 → 点据 → 比测，
+ *   以及断面测量组的大断面成果与流量测验组的冲淤对账挂靠）
  * - 纯前端应用：不依赖任何后端服务或数据库服务
  */
 import Dexie, { liveQuery, type Table } from 'dexie'
@@ -12,12 +13,16 @@ import type { Vertical } from '@/types/vertical'
 import type { Point } from '@/types/point'
 import type { Rating } from '@/types/rating'
 import type { Compare } from '@/types/compare'
+import type { SurveyResult } from '@/types/survey'
+import { effectiveSurveyAt } from '@/types/survey'
+import type { ScourLink } from '@/types/scour'
 import { calcDeviationPct, judgeDeviation } from '@/types/compare'
 import { fitPowerCurve } from '@/types/rating'
 import { calcMeanVelocity, DEFAULT_WEIGHTS, round } from '@/utils/flow'
+import { evaluateScour } from '@/utils/scour'
 
 /** 当前数据结构版本号：每次调整字段结构必须 +1 并补迁移 */
-export const DB_VERSION = 2
+export const DB_VERSION = 3
 
 /** 数据库名（浏览器 IndexedDB 中的库名） */
 export const DB_NAME = 'gbhydrogaug'
@@ -40,6 +45,10 @@ export interface BackupPayload {
   points: Point[]
   ratings: Rating[]
   compares: Compare[]
+  /** 大断面成果（断面测量组） */
+  surveyResults: SurveyResult[]
+  /** 冲淤对账挂靠与比测结论（流量测验组） */
+  scourLinks: ScourLink[]
 }
 
 class HydroGaugeDatabase extends Dexie {
@@ -49,6 +58,8 @@ class HydroGaugeDatabase extends Dexie {
   points!: Table<Point, string>
   ratings!: Table<Rating, string>
   compares!: Table<Compare, string>
+  surveyResults!: Table<SurveyResult, string>
+  scourLinks!: Table<ScourLink, string>
 
   constructor() {
     super(DB_NAME)
@@ -64,6 +75,17 @@ class HydroGaugeDatabase extends Dexie {
     })
 
     // v2：补齐筛选与统计需要的索引（河名/集水面积、水位、测法、偏差判定）
+    this.version(2).stores({
+      stations: 'id, name, river, sectionCode, catchmentKm2, updatedAt',
+      sections: 'id, stationId, measureNo, method, stageM, measuredAt, updatedAt',
+      verticals: 'id, sectionId, no, startDistanceM, depthM, updatedAt',
+      points: 'id, verticalId, relativeDepth, velocityMs, updatedAt',
+      ratings: 'id, stationId, lineNo, stageM, flowM3s, measuredAt, updatedAt',
+      compares: 'id, ratingId, verdict, deviationPct, comparedAt, updatedAt'
+    })
+
+    // v3：新增大断面成果（测量组）与冲淤对账（流量测验组）两张表。
+    // 旧数据没记归属：升级时按测次时间补最近一份成果，补不上的单列为待挂。
     this.version(DB_VERSION)
       .stores({
         stations: 'id, name, river, sectionCode, catchmentKm2, updatedAt',
@@ -71,10 +93,13 @@ class HydroGaugeDatabase extends Dexie {
         verticals: 'id, sectionId, no, startDistanceM, depthM, updatedAt',
         points: 'id, verticalId, relativeDepth, velocityMs, updatedAt',
         ratings: 'id, stationId, lineNo, stageM, flowM3s, measuredAt, updatedAt',
-        compares: 'id, ratingId, verdict, deviationPct, comparedAt, updatedAt'
+        compares: 'id, ratingId, verdict, deviationPct, comparedAt, updatedAt',
+        surveyResults: 'id, stationId, status, measuredAt, surveyNo, updatedAt',
+        scourLinks: 'id, stationId, sectionId, surveyResultId, measureNo, linkStatus, updatedAt'
       })
       .upgrade(async (tx) => {
-        // 迁移：历史数据补齐时间戳与判定结论，避免列表排序与筛选拿到 undefined
+        // 历史字段补齐（仅补缺失项，绝不覆盖旧值，尤其不能覆盖 measuredAt，
+        // 否则「按测次时间补最近成果」会对不上）
         const stamps: Array<[string, () => Record<string, unknown>]> = [
           ['stations', () => ({})],
           ['sections', () => ({ measuredAt: new Date().toISOString() })],
@@ -91,14 +116,58 @@ class HydroGaugeDatabase extends Dexie {
               const now = Date.now()
               if (typeof row.createdAt !== 'number') row.createdAt = now
               if (typeof row.updatedAt !== 'number') row.updatedAt = row.createdAt
-              Object.assign(row, defaults())
+              Object.entries(defaults()).forEach(([key, value]) => {
+                if (row[key] === undefined || row[key] === null) row[key] = value
+              })
             })
+        }
+
+        // 旧测次没记成果归属：按测次时间补同站最近一份成果；补不上的单列为「待挂」
+        const surveys = (await tx.table<SurveyResult, string>('surveyResults').toArray()) as SurveyResult[]
+        const sections = (await tx.table<Section, string>('sections').toArray()) as Section[]
+        const now = Date.now()
+        const legacyLinks: ScourLink[] = sections.map((section) => {
+          const survey = effectiveSurveyAt(surveys, section.stationId, section.measuredAt)
+          return {
+            id: createId('lnk'),
+            stationId: section.stationId,
+            measureNo: section.measureNo,
+            sectionId: section.id,
+            surveyResultId: survey ? survey.id : null,
+            linkStatus: survey ? '已挂' : '待挂',
+            stageM: section.stageM,
+            checks: [],
+            deviationCount: 0,
+            comparedCount: 0,
+            maxDeviationM: 0,
+            sectionFlowM3s: 0,
+            conclusion: survey ? '升级时按测次时间补挂最近成果，请重新比对' : '待挂成果',
+            checkedAt: null,
+            detachedFromId: null,
+            createdAt: now,
+            updatedAt: now
+          }
+        })
+        if (legacyLinks.length > 0) {
+          await tx.table('scourLinks').bulkPut(legacyLinks)
         }
       })
   }
 }
 
 export const db = new HydroGaugeDatabase()
+
+/** 业务表清单（清库、统计、导入事务共用） */
+export const BUSINESS_TABLES = [
+  db.stations,
+  db.sections,
+  db.verticals,
+  db.points,
+  db.ratings,
+  db.compares,
+  db.surveyResults,
+  db.scourLinks
+] as const
 
 /** 生成主键：短前缀 + 时间戳 + 随机串，避免多标签页写入冲突 */
 export function createId(prefix: string): string {
@@ -131,7 +200,9 @@ interface SeedStationBundle {
 
 /**
  * 播种演示数据：3 个测站 → 4 个断面测次 → 8 条垂线 → 16 个流速测点，
- * 并据此生成水位流量关系点据与比测记录，保证父 → 子 → 孙三层链路可点开。
+ * 并据此生成水位流量关系点据与比测记录；同时播种 3 份大断面成果与 4 条冲淤挂靠
+ * （含汛后冲刷、汛后淤积各一例，以及 1 个补不上成果的待挂测次），
+ * 保证父 → 子 → 孙三层链路与「成果 → 挂靠 → 逐条比对」链路均可点开。
  */
 export async function seedDemoData(): Promise<void> {
   const now = Date.now()
@@ -241,7 +312,7 @@ export async function seedDemoData(): Promise<void> {
         river: '澜沧江',
         catchmentKm2: 51200,
         sectionCode: 'CS-BS-03',
-        remark: '巡测断面，与龙门站比测'
+        remark: '巡测断面，与龙门站比测；尚未施测大断面成果'
       },
       sections: [
         {
@@ -269,6 +340,58 @@ export async function seedDemoData(): Promise<void> {
     }
   ]
 
+  /* ------------------- 大断面成果（断面测量组） ------------------- */
+  // 龙门站：汛前成果已存档，汛后复测成果生效；7 月测次挂汛后成果，实测主槽更深 → 冲刷偏差
+  // 青矶站：仅汛前一份生效成果，8 月测次按内插高程折算，实测普遍偏浅 → 淤积偏差
+  // 白沙滩站：没有成果，其测次升级/补挂时只能单列为待挂
+  const surveySeeds: Array<Omit<SurveyResult, 'createdAt' | 'updatedAt'>> = [
+    {
+      id: 'surv_lh_01',
+      stationId: 'stn_lh01',
+      surveyNo: 'DC-LM-2024-01',
+      measuredAt: '2024-03-15T02:00:00.000Z',
+      status: '存档',
+      remark: '汛前大断面，左岸砾石、主槽砂卵石',
+      points: [
+        { startDistanceM: 0, bedElevM: 4.6 },
+        { startDistanceM: 6.5, bedElevM: 4.02 },
+        { startDistanceM: 14.0, bedElevM: 2.22 },
+        { startDistanceM: 22.0, bedElevM: 3.32 },
+        { startDistanceM: 30.0, bedElevM: 3.8 }
+      ]
+    },
+    {
+      id: 'surv_lh_02',
+      stationId: 'stn_lh01',
+      surveyNo: 'DC-LM-2024-02',
+      measuredAt: '2024-07-01T02:00:00.000Z',
+      status: '生效',
+      remark: '汛后冲淤复测，主槽刷深',
+      points: [
+        { startDistanceM: 0, bedElevM: 4.55 },
+        { startDistanceM: 8.0, bedElevM: 2.85 },
+        { startDistanceM: 14.0, bedElevM: 2.05 },
+        { startDistanceM: 22.0, bedElevM: 3.2 },
+        { startDistanceM: 30.0, bedElevM: 3.7 }
+      ]
+    },
+    {
+      id: 'surv_qj_01',
+      stationId: 'stn_qj02',
+      surveyNo: 'DC-QJ-2024-01',
+      measuredAt: '2024-04-20T02:00:00.000Z',
+      status: '生效',
+      remark: '汛前大断面，浮标断面与流速仪断面共用',
+      points: [
+        { startDistanceM: 0, bedElevM: 2.6 },
+        { startDistanceM: 2.4, bedElevM: 2.08 },
+        { startDistanceM: 4.0, bedElevM: 2.0 },
+        { startDistanceM: 6.8, bedElevM: 1.28 },
+        { startDistanceM: 8.5, bedElevM: 1.2 }
+      ]
+    }
+  ]
+
   // 水位流量关系点据：A 线为龙门站主定线，B 线为青矶站定线
   const ratingSeeds: Array<Omit<Rating, 'createdAt' | 'updatedAt'>> = [
     { id: 'rat_lh_a1', stationId: 'stn_lh01', stageM: 4.01, flowM3s: 97.5, lineNo: 'A', measureNo: '2024-04-001', measuredAt: '2024-04-08T08:00:00.000Z' },
@@ -287,78 +410,124 @@ export async function seedDemoData(): Promise<void> {
     { id: 'rat_bs_c4', stationId: 'stn_bs03', stageM: 6.44, flowM3s: 288.0, lineNo: 'C', measureNo: '2024-08-008', measuredAt: '2024-08-15T09:40:00.000Z' }
   ]
 
-  await db.transaction(
-    'rw',
-    [db.stations, db.sections, db.verticals, db.points, db.ratings, db.compares],
-    async () => {
-      const stamp = (row: { id: string }): { createdAt: number; updatedAt: number } => ({
-        createdAt: now + row.id.length,
-        updatedAt: now + row.id.length
-      })
+  await db.transaction('rw', BUSINESS_TABLES, async () => {
+    const stamp = (row: { id: string }): { createdAt: number; updatedAt: number } => ({
+      createdAt: now + row.id.length,
+      updatedAt: now + row.id.length
+    })
 
-      await db.stations.bulkPut(
-        stationBundles.map((bundle) => ({ ...bundle.station, ...stamp(bundle.station) }))
+    await db.stations.bulkPut(
+      stationBundles.map((bundle) => ({ ...bundle.station, ...stamp(bundle.station) }))
+    )
+    await db.sections.bulkPut(
+      stationBundles.flatMap((bundle) =>
+        bundle.sections.map((section) => ({ ...section, ...stamp(section) }))
       )
-      await db.sections.bulkPut(
-        stationBundles.flatMap((bundle) =>
-          bundle.sections.map((section) => ({ ...section, ...stamp(section) }))
-        )
+    )
+    await db.verticals.bulkPut(
+      stationBundles.flatMap((bundle) =>
+        bundle.verticals.map((vertical) => ({ ...vertical, ...stamp(vertical) }))
       )
-      await db.verticals.bulkPut(
-        stationBundles.flatMap((bundle) =>
-          bundle.verticals.map((vertical) => ({ ...vertical, ...stamp(vertical) }))
-        )
+    )
+    await db.points.bulkPut(
+      stationBundles.flatMap((bundle) =>
+        bundle.points.map((point) => ({ ...point, ...stamp(point) }))
       )
-      await db.points.bulkPut(
-        stationBundles.flatMap((bundle) =>
-          bundle.points.map((point) => ({ ...point, ...stamp(point) }))
-        )
-      )
-      await db.ratings.bulkPut(ratingSeeds.map((rating) => ({ ...rating, ...stamp(rating) })))
+    )
+    await db.ratings.bulkPut(ratingSeeds.map((rating) => ({ ...rating, ...stamp(rating) })))
+    await db.surveyResults.bulkPut(surveySeeds.map((survey) => ({ ...survey, ...stamp(survey) })))
 
-      // 比测记录：按定线拟合出曲线流量后计算偏差与判定，保证与页面展示一致
-      const compares: Compare[] = []
-      const lineGroups = new Map<string, Array<{ stageM: number; flowM3s: number }>>()
-      ratingSeeds.forEach((rating) => {
-        const list = lineGroups.get(rating.lineNo) ?? []
-        list.push({ stageM: rating.stageM, flowM3s: rating.flowM3s })
-        lineGroups.set(rating.lineNo, list)
+    // 比测记录：按定线拟合出曲线流量后计算偏差与判定，保证与页面展示一致
+    const compares: Compare[] = []
+    const lineGroups = new Map<string, Array<{ stageM: number; flowM3s: number }>>()
+    ratingSeeds.forEach((rating) => {
+      const list = lineGroups.get(rating.lineNo) ?? []
+      list.push({ stageM: rating.stageM, flowM3s: rating.flowM3s })
+      lineGroups.set(rating.lineNo, list)
+    })
+    ratingSeeds.forEach((rating) => {
+      const fit = fitPowerCurve(lineGroups.get(rating.lineNo) ?? [], rating.lineNo)
+      if (!fit.valid) return
+      const predicted = round(fit.a * Math.pow(Math.max(rating.stageM - fit.h0, 1e-6), fit.b), 2)
+      const deviationPct = calcDeviationPct(rating.flowM3s, predicted)
+      compares.push({
+        id: `cmp_${rating.id}`,
+        ratingId: rating.id,
+        measuredFlow: rating.flowM3s,
+        curveFlow: predicted,
+        deviationPct,
+        verdict: judgeDeviation(deviationPct),
+        operator: rating.lineNo === 'C' ? '周渝' : '林昭',
+        comparedAt: rating.measuredAt,
+        createdAt: now,
+        updatedAt: now
       })
-      ratingSeeds.forEach((rating) => {
-        const fit = fitPowerCurve(lineGroups.get(rating.lineNo) ?? [], rating.lineNo)
-        if (!fit.valid) return
-        const predicted = round(fit.a * Math.pow(Math.max(rating.stageM - fit.h0, 1e-6), fit.b), 2)
-        const deviationPct = calcDeviationPct(rating.flowM3s, predicted)
-        compares.push({
-          id: `cmp_${rating.id}`,
-          ratingId: rating.id,
-          measuredFlow: rating.flowM3s,
-          curveFlow: predicted,
-          deviationPct,
-          verdict: judgeDeviation(deviationPct),
-          operator: rating.lineNo === 'C' ? '周渝' : '林昭',
-          comparedAt: rating.measuredAt,
-          createdAt: now,
-          updatedAt: now
-        })
+    })
+    await db.compares.bulkPut(compares)
+    if (compares.length === 0) {
+      await db.compares.put({
+        id: 'cmp_fallback',
+        ratingId: 'rat_lh_a1',
+        measuredFlow: 97.5,
+        curveFlow: 100.2,
+        deviationPct: calcDeviationPct(97.5, 100.2),
+        verdict: judgeDeviation(calcDeviationPct(97.5, 100.2)),
+        operator: '林昭',
+        comparedAt: iso,
+        createdAt: now,
+        updatedAt: now
       })
-      await db.compares.bulkPut(compares)
-      if (compares.length === 0) {
-        await db.compares.put({
-          id: 'cmp_fallback',
-          ratingId: 'rat_lh_a1',
-          measuredFlow: 97.5,
-          curveFlow: 100.2,
-          deviationPct: calcDeviationPct(97.5, 100.2),
-          verdict: judgeDeviation(calcDeviationPct(97.5, 100.2)),
-          operator: '林昭',
-          comparedAt: iso,
-          createdAt: now,
-          updatedAt: now
-        })
-      }
     }
-  )
+
+    // 冲淤挂靠：逐条垂线用实测水深与成果折算水对比，断面流量仍按实测水深计算
+    const allSections: Section[] = stationBundles.flatMap((bundle) =>
+      bundle.sections.map((section) => ({ ...section, ...stamp(section) }))
+    )
+    const surveyRecords: SurveyResult[] = surveySeeds.map((survey) => ({ ...survey, ...stamp(survey) }))
+    const allVerticals: Vertical[] = stationBundles.flatMap((bundle) =>
+      bundle.verticals.map((vertical) => ({ ...vertical, ...stamp(vertical) }))
+    )
+    const allPoints: Point[] = stationBundles.flatMap((bundle) =>
+      bundle.points.map((point) => ({ ...point, ...stamp(point) }))
+    )
+    const sectionSurvey: Record<string, string | null> = {
+      sec_lh_2406: 'surv_lh_01',
+      sec_lh_2407: 'surv_lh_02',
+      sec_qj_2405: 'surv_qj_01',
+      sec_qj_2408: 'surv_qj_01',
+      sec_bs_2406: null
+    }
+    const scourLinks: ScourLink[] = allSections.map((section) => {
+      const surveyId = sectionSurvey[section.id] ?? null
+      const survey = surveyRecords.find((item) => item.id === surveyId) ?? null
+      const verticalsOf = allVerticals.filter((vertical) => vertical.sectionId === section.id)
+      const inputs = verticalsOf.map((vertical) => ({
+        vertical,
+        points: allPoints.filter((point) => point.verticalId === vertical.id)
+      }))
+      const result = evaluateScour(section, survey, inputs)
+      return {
+        id: `lnk_${section.id}`,
+        stationId: section.stationId,
+        measureNo: section.measureNo,
+        sectionId: section.id,
+        surveyResultId: survey ? survey.id : null,
+        linkStatus: survey ? '已挂' : '待挂',
+        stageM: section.stageM,
+        checks: result.checks,
+        deviationCount: result.deviationCount,
+        comparedCount: result.comparedCount,
+        maxDeviationM: result.maxDeviationM,
+        sectionFlowM3s: result.sectionFlowM3s,
+        conclusion: result.conclusion,
+        checkedAt: section.measuredAt,
+        detachedFromId: null,
+        createdAt: now,
+        updatedAt: now
+      }
+    })
+    await db.scourLinks.bulkPut(scourLinks)
+  })
 }
 
 /** 打开数据库并幂等播种：仅当测站表为空时灌入演示数据 */
@@ -373,20 +542,18 @@ export async function initDatabase(): Promise<void> {
 
 /** 清空全部业务表（导入覆盖与重置共用） */
 export async function clearAllTables(): Promise<void> {
-  await db.transaction(
-    'rw',
-    [db.stations, db.sections, db.verticals, db.points, db.ratings, db.compares],
-    async () => {
-      await Promise.all([
-        db.stations.clear(),
-        db.sections.clear(),
-        db.verticals.clear(),
-        db.points.clear(),
-        db.ratings.clear(),
-        db.compares.clear()
-      ])
-    }
-  )
+  await db.transaction('rw', BUSINESS_TABLES, async () => {
+    await Promise.all([
+      db.stations.clear(),
+      db.sections.clear(),
+      db.verticals.clear(),
+      db.points.clear(),
+      db.ratings.clear(),
+      db.compares.clear(),
+      db.surveyResults.clear(),
+      db.scourLinks.clear()
+    ])
+  })
 }
 
 /** 清空并重新播种演示数据 */
@@ -397,15 +564,76 @@ export async function resetDatabase(): Promise<void> {
 
 /** 统计各表行数，供页脚概览与导出页展示 */
 export async function countAll(): Promise<Record<string, number>> {
-  const [stations, sections, verticals, points, ratings, compares] = await Promise.all([
+  const [stations, sections, verticals, points, ratings, compares, surveyResults, scourLinks] = await Promise.all([
     db.stations.count(),
     db.sections.count(),
     db.verticals.count(),
     db.points.count(),
     db.ratings.count(),
-    db.compares.count()
+    db.compares.count(),
+    db.surveyResults.count(),
+    db.scourLinks.count()
   ])
-  return { stations, sections, verticals, points, ratings, compares }
+  return { stations, sections, verticals, points, ratings, compares, surveyResults, scourLinks }
+}
+
+/**
+ * 测次时间改动后，把挂靠在该测次上的成果退回「待挂」（流量测验组本侧重挂）。
+ * 测量组那份成果本身不动：只清流量侧的挂靠指针，并记下原挂靠成果供提示。
+ */
+export async function detachLinksForSection(sectionId: string): Promise<number> {
+  const now = Date.now()
+  let changed = 0
+  await db.scourLinks.where('sectionId').equals(sectionId).modify((link) => {
+    if (link.linkStatus === '待挂' && link.surveyResultId === null) return
+    changed += 1
+    link.detachedFromId = link.surveyResultId ?? link.detachedFromId
+    link.surveyResultId = null
+    link.linkStatus = '待挂'
+    link.stageM = 0
+    link.checks = []
+    link.deviationCount = 0
+    link.comparedCount = 0
+    link.maxDeviationM = 0
+    link.sectionFlowM3s = 0
+    link.conclusion = '待挂成果'
+    link.checkedAt = null
+    link.updatedAt = now
+  })
+  return changed
+}
+
+/** 删除某测次的挂靠记录（测次删除时级联） */
+export async function deleteLinksForSection(sectionId: string): Promise<void> {
+  await db.scourLinks.where('sectionId').equals(sectionId).delete()
+}
+
+/** 删除测站时级联清理其成果与挂靠 */
+export async function deleteSurveyDataForStation(stationId: string): Promise<void> {
+  await db.transaction('rw', [db.surveyResults, db.scourLinks], async () => {
+    await db.scourLinks.where('stationId').equals(stationId).delete()
+    await db.surveyResults.where('stationId').equals(stationId).delete()
+  })
+}
+
+/** 测量组删除成果后，引用它的挂靠退回待挂（成果原件已删，挂靠无法维持） */
+export async function detachLinksForSurvey(surveyResultId: string): Promise<number> {
+  const now = Date.now()
+  let changed = 0
+  await db.scourLinks.where('surveyResultId').equals(surveyResultId).modify((link) => {
+    changed += 1
+    link.detachedFromId = link.surveyResultId
+    link.surveyResultId = null
+    link.linkStatus = '待挂'
+    link.checks = []
+    link.deviationCount = 0
+    link.comparedCount = 0
+    link.maxDeviationM = 0
+    link.conclusion = '原挂靠成果已删除，请重新挂靠'
+    link.checkedAt = null
+    link.updatedAt = now
+  })
+  return changed
 }
 
 /** 写入结构版本号到 localStorage，便于导出页比对 */

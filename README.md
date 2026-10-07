@@ -1,6 +1,6 @@
 # sologsb101-1011 水文站流量测验与绳套曲线台
 
-面向水文站测验与资料整编人员的纯前端单页应用：把每次测流的测站、断面测次、垂线测深、流速测点逐层落档，据此整理水位—流量关系点据完成幂函数定线，并开展比测偏差分析。数据全部保存在浏览器本地（IndexedDB），不依赖任何后端服务或外部接口。
+面向水文站测验与资料整编人员的纯前端单页应用：把每次测流的测站、断面测次、垂线测深、流速测点逐层落档；断面测量组另立大断面成果台账（施测日期 + 各起点距河底高程，同站只留一份生效），流量测验组按测次号把测次挂上当时生效的成果，拿垂线实测水深与成果按水位折算的水深逐条对比判汛后冲淤偏差，实测水深照旧算断面流量。并据此整理水位—流量关系点据完成幂函数定线、开展比测偏差分析。数据全部保存在浏览器本地（IndexedDB），不依赖任何后端服务或外部接口。
 
 ## 一、Docker 一键启动（推荐）
 
@@ -32,7 +32,7 @@ docker compose up -d --build      # 修改代码后重新构建
 | 构建 | Vite 6 | 产物 `dist/`，交给 nginx 托管 |
 | 状态管理 | Pinia 2（setup store） | `stationStore` / `sectionStore` / `ratingStore` |
 | 路由 | Vue Router 4（history 模式） | 路径与提示词逐字一致，支持深链刷新 |
-| 持久化 | Dexie 4（IndexedDB，库名 `gbhydrogaug`） | 结构版本 v2 + upgrade 迁移 + liveQuery 订阅 |
+| 持久化 | Dexie 4（IndexedDB，库名 `gbhydrogaug`） | 结构版本 v3 + upgrade 迁移 + liveQuery 订阅 |
 | 容器 | node:20-alpine 构建 → nginx:alpine 运行 | 多阶段构建，运行阶段 `chmod -R a+rX` |
 
 ## 三、路由与功能模块
@@ -41,8 +41,11 @@ docker compose up -d --build      # 修改代码后重新构建
 | --- | --- | --- | --- |
 | `/stations` | 测站台账 | Station、Section、Rating | 新建/编辑/删除测站，按河名与集水面积分档筛选，卡片回显测次数、最新水位与比测合格率 |
 | `/stations/:id/sections` | 断面测次列表与测法标记 | Section、Station | 新增测次（测次号、起点距、水位、流速仪/浮标/ADCP），水位筛选，回显当前水位与水位变幅 |
-| `/sections/:id/verticals` | 垂线布设与测深 | Vertical、Section | 起点距排序校验（重复即时告警）、按测点数自动生成测点行、部分面积法断面流量成果 |
+| `/sections/:id/verticals` | 垂线布设与测深 | Vertical、Section | 起点距排序校验（重复即时告警）、按测点数自动生成测点行、部分面积法断面流量成果、挂靠与冲淤偏差状态提示 |
 | `/verticals/:id/points` | 流速测点录入 | Point、Vertical | 逐点录入相对水深与流速、批量粘贴导入、批量改写流速、权重归一、垂线流速分布图 |
+| `/stations/:id/surveys` | 大断面成果台账（断面测量组） | SurveyResult、ScourLink | 施测成果记施测日期与起点距—河底高程，同站只留一份生效（新成果生效旧成果转存档），可设为生效 / 存档 / 删除 |
+| `/sections/:id/scour` | 汛后冲淤对账（流量测验组） | ScourLink、SurveyResult、Vertical | 挂当时生效成果，成果水深=水位−同起点距河底高程，逐条对实测水深，超限标冲/淤偏差并随侧重算断面流量与比测结论；改测次时间退回待挂本侧重挂 |
+| `/scour-pending` | 待挂成果队列 | ScourLink、Section、SurveyResult | 时间改动作废 / 升级补不上 / 新建未挂测次单列，一键按测次时间补最近成果或逐条手工重挂 |
 | `/ratings` | 水位流量关系点据与定线 | Rating、Compare | 幂函数定线 Q=a(H-H0)^b（自动搜索基线并给出 R²、平均/最大残差）、超限点挂红、关系曲线绘制 |
 | `/export` | 比测偏差分析与导出 | 全部模型 | 按测站出检测结论、比测偏差分析清单、全量 JSON 导入导出、清空重建演示数据 |
 
@@ -71,14 +74,14 @@ sologsb101-1011/
         ├── main.ts             # 挂载 Pinia / Router / Element Plus，并打开并播种数据库
         ├── App.vue             # 顶部导航 + 上下文快捷入口 + 页脚数据概览
         ├── env.d.ts
-        ├── types/              # station / section / vertical / point / rating / compare / filter
-        ├── stores/             # stationStore / sectionStore / ratingStore
-        ├── components/common/  # DeviationTag / FilterBar / StatBadge / EmptyPanel / RouteMissingPanel
+        ├── types/              # station / section / vertical / point / rating / compare / survey / scour / filter
+        ├── stores/             # stationStore / sectionStore / ratingStore / surveyStore / scourStore
+        ├── components/common/  # DeviationTag / ScourStatusTag / FilterBar / StatBadge / EmptyPanel / RouteMissingPanel
         ├── hooks/              # useIdbTable / useRatingFit
-        ├── pages/              # StationList / SectionList / VerticalBoard / PointEntry / RatingChart / ExportView
+        ├── pages/              # StationList / SectionList / VerticalBoard / PointEntry / SurveyBoard / ScourBoard / ScourPending / RatingChart / ExportView
         ├── router/index.ts     # 路由表（路径与提示词逐字一致）
         ├── styles/main.css
-        └── utils/              # flow.ts（流量计算）/ db.ts（Dexie 封装）/ export.ts（导入导出）
+        └── utils/              # flow.ts（流量计算）/ scour.ts（冲淤逐条比对）/ db.ts（Dexie 封装）/ export.ts（导入导出）
 ```
 
 ## 五、本地开发
@@ -93,10 +96,16 @@ npm run preview    # 预览构建产物
 
 ## 六、数据存储说明
 
-- **存储位置**：浏览器 IndexedDB，库名 `gbhydrogaug`，当前结构版本 `v2`。页面侧由 `frontend/src/utils/db.ts` 统一封装，页面组件不直接触碰 Dexie 实例。
-- **数据表**：`stations`（测站）、`sections`（断面测次）、`verticals`（垂线）、`points`（流速测点）、`ratings`（水位流量关系点据）、`compares`（比测记录）。
-- **升级迁移**：`db.version(1)` 保留初版结构，`db.version(2).stores(...).upgrade(...)` 补齐索引并回填历史数据缺失的时间戳与判定结论；调整字段结构时递增 `DB_VERSION` 并在 `upgrade` 中补迁移。
-- **首屏播种**：`initDatabase()` 在 `stations` 表为空时执行幂等播种，生成三层互相引用的演示数据（3 个测站 / 4 个断面测次 / 8 条垂线 / 16 个流速测点 / 13 个关系点据 / 13 条比测记录），其中 C 线含 2 个超限点据用于演示挂红与偏差分析。
+- **存储位置**：浏览器 IndexedDB，库名 `gbhydrogaug`，当前结构版本 `v3`。页面侧由 `frontend/src/utils/db.ts` 统一封装，页面组件不直接触碰 Dexie 实例。
+- **数据表**：`stations`（测站）、`sections`（断面测次）、`verticals`（垂线）、`points`（流速测点）、`ratings`（水位流量关系点据）、`compares`（比测记录）、`surveyResults`（大断面成果，断面测量组）、`scourLinks`（测次—成果挂靠与冲淤逐条比对，流量测验组）。
+- **冲淤对账规则**：
+  - 大断面成果记施测日期与各起点距河底高程，同站同一时刻只留一份生效，新成果生效时旧成果自动转存档；存档成果仍可被历史测次挂靠。
+  - 测次按测次号对账并挂上当时生效成果（施测日期不晚于测流时间的最近一份）；成果水深 = 测次水位 − 成果同起点距河底高程（同起点距取值，否则相邻点线性内插），与垂线实测水深逐条对比，相差超过 `0.3 m` 判冲淤偏差（正冲负淤）。
+  - 河底高程只用于判偏差；断面流量始终按实测水深与测点流速用部分面积法计算，垂线 / 测点改动后自动去抖重算并刷新比测结论。
+  - 测次时间一改动，挂靠作废退回待挂（清空流量侧指针、保留原成果 id 供提示），测量组那份成果不动，由流量测验组在本侧重挂；删除成果同样只让引用它的挂靠退回待挂。
+- **升级迁移**：`db.version(1)` 保留初版结构，`db.version(2).stores(...)` 补齐索引；`db.version(3).stores(...)` 新增成果与挂靠两张表，升级时旧测次没记归属的，按测次时间补同站最近成果，补不上的单列为待挂；字段补齐只写缺失项、不覆盖旧值。调整字段结构时递增 `DB_VERSION` 并在 `upgrade` 中补迁移。
+- **首屏播种**：`initDatabase()` 在 `stations` 表为空时执行幂等播种，生成三层互相引用的演示数据（3 个测站 / 4 个断面测次 / 8 条垂线 / 16 个流速测点 / 13 个关系点据 / 13 条比测记录 / 3 份大断面成果 / 4 条冲淤挂靠），其中含汛后主槽冲刷、汛后淤积各一例及 1 个补不上成果的待挂测次，C 线另含 2 个超限点据用于演示挂红与偏差分析。
 - **实时同步**：`utils/db.ts` 的 `watchTable()` 基于 Dexie `liveQuery` 订阅表变化，store 里的列表自动刷新，无需手动处理刷新时机。
-- **备份与恢复**：`/export` 页可导出包含六张表的 JSON 快照，支持「覆盖导入」与「追加导入（重新分配 id）」两种模式；备份时间写入 `localStorage`。
+- **备份与恢复**：`/export` 页可导出包含八张表的 JSON 快照，支持「覆盖导入」与「追加导入（重新分配 id）」两种模式；覆盖导入后自动重算全部已挂测次的冲淤比对与断面流量；备份时间写入 `localStorage`。
 - **离线可用**：应用为纯静态资源，无任何网络请求；换浏览器 / 清空站点数据后数据不会跟随，需通过 JSON 备份迁移。
+- **本地校验脚本**：`npm run test:scour`（基于 fake-indexeddb + tsx）依次验证 v2→v3 升级补挂 / 待挂、播种数据的冲淤判定、改时间作废→重挂→测点改流速联动重算三条关键链路。

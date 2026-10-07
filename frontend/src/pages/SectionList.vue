@@ -6,14 +6,16 @@
 import { computed, onMounted, reactive, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Delete, Edit, Plus, Right, Timer } from '@element-plus/icons-vue'
+import { Aim, Delete, Edit, Plus, Right, Timer, Connection } from '@element-plus/icons-vue'
 import FilterBar from '@/components/common/FilterBar.vue'
 import type { FilterModel } from '@/types/filter'
 import StatBadge from '@/components/common/StatBadge.vue'
 import EmptyPanel from '@/components/common/EmptyPanel.vue'
 import RouteMissingPanel from '@/components/common/RouteMissingPanel.vue'
+import ScourStatusTag from '@/components/common/ScourStatusTag.vue'
 import { useStationStore } from '@/stores/stationStore'
 import { useSectionStore } from '@/stores/sectionStore'
+import { useScourStore } from '@/stores/scourStore'
 import { MEASURE_METHODS, type MeasureMethod, type Section } from '@/types/section'
 import { initDatabase } from '@/utils/db'
 
@@ -21,6 +23,7 @@ const route = useRoute()
 const router = useRouter()
 const stationStore = useStationStore()
 const sectionStore = useSectionStore()
+const scourStore = useScourStore()
 
 const stationId = computed(() => String(route.params.id ?? ''))
 const station = computed(() => stationStore.stationById(stationId.value))
@@ -60,6 +63,7 @@ const stats = computed(() => {
     (sum, section) => sum + (sectionStore.sectionVerticalCounts[section.id] ?? 0),
     0
   )
+  const stationLinks = scourStore.links.filter((link) => link.stationId === stationId.value)
   return {
     count: list.length,
     maxStageM: stages.length ? Math.max(...stages) : null,
@@ -69,7 +73,9 @@ const stats = computed(() => {
       return Date.parse(section.measuredAt) > Date.parse(acc.measuredAt) ? section : acc
     }, null),
     verticalCount,
-    currentStageM: list.length ? list[0].stageM : null
+    currentStageM: list.length ? list[0].stageM : null,
+    pendingCount: stationLinks.filter((link) => link.linkStatus === '待挂').length,
+    deviationCount: stationLinks.filter((link) => link.linkStatus === '已挂' && link.deviationCount > 0).length
   }
 })
 
@@ -123,8 +129,15 @@ async function submitForm(): Promise<void> {
       measuredAt: new Date(form.measuredAt).toISOString()
     }
     if (editingId.value) {
+      const before = sectionStore.sectionById(editingId.value)
       await sectionStore.updateSection(editingId.value, payload)
-      ElMessage.success('测次已更新')
+      const timeChanged =
+        before && Date.parse(before.measuredAt) !== Date.parse(new Date(form.measuredAt).toISOString())
+      ElMessage.success(
+        timeChanged
+          ? '测次已更新；测流时间改动使原成果挂靠作废，已退回待挂，请重挂'
+          : '测次已更新'
+      )
     } else {
       const created = await sectionStore.createSection(payload)
       sectionStore.selectSection(created.id)
@@ -153,6 +166,10 @@ async function removeSection(section: Section): Promise<void> {
 function gotoVerticals(section: Section): void {
   sectionStore.selectSection(section.id)
   void router.push(`/sections/${section.id}/verticals`)
+}
+
+function gotoScour(section: Section): void {
+  void router.push(`/sections/${section.id}/scour`)
 }
 
 function handleFilterChange(): void {
@@ -223,7 +240,10 @@ onMounted(() => {
             集水面积 {{ station.catchmentKm2 }} km²。每次测流记录测次号、起点距、水位与测法，随后布设垂线并录流速测点。
           </p>
         </div>
-        <el-button type="primary" :icon="Plus" @click="openCreate">新增测次</el-button>
+        <div class="page__head-actions">
+          <el-button :icon="Aim" @click="router.push(`/stations/${stationId}/surveys`)">大断面成果</el-button>
+          <el-button type="primary" :icon="Plus" @click="openCreate">新增测次</el-button>
+        </div>
       </div>
 
       <div class="gb-stats-row">
@@ -243,6 +263,20 @@ onMounted(() => {
           icon="TrendCharts"
         />
         <StatBadge label="垂线合计" :value="stats.verticalCount" suffix="条" tone="success" icon="Histogram" />
+        <StatBadge
+          label="待挂成果"
+          :value="stats.pendingCount"
+          suffix="次"
+          :tone="stats.pendingCount > 0 ? 'warning' : 'primary'"
+          icon="Connection"
+        />
+        <StatBadge
+          label="冲淤偏差测次"
+          :value="stats.deviationCount"
+          suffix="次"
+          :tone="stats.deviationCount > 0 ? 'danger' : 'primary'"
+          icon="WarningFilled"
+        />
       </div>
 
       <FilterBar
@@ -298,14 +332,26 @@ onMounted(() => {
             </el-button>
           </template>
         </el-table-column>
+        <el-table-column label="成果挂靠 / 冲淤" width="170" align="center">
+          <template #default="{ row }">
+            <el-button text size="small" @click="gotoScour(row)">
+              <ScourStatusTag
+                :link-status="scourStore.linkOfSection(row.id)?.linkStatus ?? '待挂'"
+                :deviation-count="scourStore.linkOfSection(row.id)?.deviationCount ?? 0"
+                show-text
+              />
+            </el-button>
+          </template>
+        </el-table-column>
         <el-table-column label="测流时间" min-width="170">
           <template #default="{ row }">
             <span class="gb-mono">{{ new Date(row.measuredAt).toLocaleString('zh-CN') }}</span>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="240" fixed="right">
+        <el-table-column label="操作" width="320" fixed="right">
           <template #default="{ row }">
             <el-button size="small" type="primary" :icon="Right" @click="gotoVerticals(row)">垂线</el-button>
+            <el-button size="small" type="warning" plain :icon="Connection" @click="gotoScour(row)">冲淤</el-button>
             <el-button size="small" :icon="Edit" @click="openEdit(row)">编辑</el-button>
             <el-button size="small" type="danger" plain :icon="Delete" @click="removeSection(row)">删除</el-button>
           </template>
@@ -317,7 +363,8 @@ onMounted(() => {
 
       <p class="gb-hint">
         <el-icon><Timer /></el-icon>
-        提示：测次的水位将参与水位流量关系点据定线；同一测次下的垂线按起点距升序参与部分面积法流量计算。
+        提示：测次挂上当时生效的大断面成果后逐条做汛后冲淤比对；改测流时间会使挂靠作废退回待挂（流量侧重挂，测量组成果不动），
+        实测水深照旧参与断面流量计算，河底高程只用于判冲淤偏差。
       </p>
     </template>
 
@@ -380,6 +427,12 @@ onMounted(() => {
 
 .page__tag {
   font-weight: 400;
+}
+
+.page__head-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
 }
 
 .page__unit {

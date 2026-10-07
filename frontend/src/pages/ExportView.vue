@@ -13,6 +13,7 @@ import EmptyPanel from '@/components/common/EmptyPanel.vue'
 import { useRatingStore } from '@/stores/ratingStore'
 import { useStationStore } from '@/stores/stationStore'
 import { useSectionStore } from '@/stores/sectionStore'
+import { useScourStore } from '@/stores/scourStore'
 import {
   DB_NAME,
   DB_VERSION,
@@ -37,6 +38,7 @@ import { fitPowerCurve } from '@/types/rating'
 const ratingStore = useRatingStore()
 const stationStore = useStationStore()
 const sectionStore = useSectionStore()
+const scourStore = useScourStore()
 
 const counts = ref<Record<string, number>>({})
 const lastBackupAt = ref<string | null>(null)
@@ -49,7 +51,7 @@ const exporting = ref(false)
 const compareRows = computed(() => ratingStore.compareRows)
 const overLimitRows = computed(() => ratingStore.overLimitRows)
 
-/** 检测结论：按测站汇总测次、最新水位、定线参数与超限点据 */
+/** 检测结论：按测站汇总测次、最新水位、定线参数、超限点据与冲淤挂靠 */
 const conclusions = ref<
   Array<{
     stationId: string
@@ -59,6 +61,10 @@ const conclusions = ref<
     latestStageM: number | null
     ratingCount: number
     overLimitCount: number
+    surveyCount: number
+    scourAttachedCount: number
+    scourPendingCount: number
+    scourDeviationCount: number
     fitText: string
   }>
 >([])
@@ -124,9 +130,10 @@ async function handleImport(): Promise<void> {
       { type: 'warning', confirmButtonText: '继续导入', cancelButtonText: '取消' }
     )
     await importBackup(payload, overwriteOnImport.value)
+    await scourStore.recomputeAll()
     await refreshCounts()
     await buildConclusions()
-    ElMessage.success('导入完成')
+    ElMessage.success('导入完成，已挂靠测次的冲淤比对与断面流量已按导入数据重算')
   } finally {
     importing.value = false
   }
@@ -135,7 +142,7 @@ async function handleImport(): Promise<void> {
 async function handleReset(): Promise<void> {
   try {
     await ElMessageBox.confirm(
-      '将清空全部本地数据并重新播种演示数据（测站、断面、垂线、测点、点据、比测）。确认继续？',
+      '将清空全部本地数据并重新播种演示数据（测站、断面、垂线、测点、点据、比测、大断面成果、冲淤挂靠）。确认继续？',
       '重置本地数据',
       { type: 'warning', confirmButtonText: '清空并重建', cancelButtonText: '取消' }
     )
@@ -222,6 +229,21 @@ onMounted(() => {
             <span class="gb-mono" :class="{ 'page__danger': row.overLimitCount > 0 }">{{ row.overLimitCount }}</span>
           </template>
         </el-table-column>
+        <el-table-column label="大断面成果" width="110" align="right">
+          <template #default="{ row }">
+            <span class="gb-mono">{{ row.surveyCount }} 份</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="冲淤挂靠（已挂/待挂/偏差）" width="200" align="center">
+          <template #default="{ row }">
+            <span class="gb-mono">
+              {{ row.scourAttachedCount }} /
+              <span :class="{ 'page__danger': row.scourPendingCount > 0 }">{{ row.scourPendingCount }}</span>
+              /
+              <span :class="{ 'page__danger': row.scourDeviationCount > 0 }">{{ row.scourDeviationCount }}</span>
+            </span>
+          </template>
+        </el-table-column>
         <el-table-column prop="fitText" label="定线成果" min-width="320" show-overflow-tooltip />
       </el-table>
     </el-card>
@@ -290,7 +312,7 @@ onMounted(() => {
       <div class="gb-panel-title">
         <h3>全量 JSON 导入导出</h3>
         <span class="gb-hint">
-          导出内容包含 stations / sections / verticals / points / ratings / compares 六张表
+          导出内容包含 stations / sections / verticals / points / ratings / compares / surveyResults / scourLinks 八张表
         </span>
       </div>
 
@@ -333,6 +355,9 @@ onMounted(() => {
         </el-descriptions-item>
         <el-descriptions-item label="点据 / 比测">
           {{ counts.ratings ?? 0 }} / {{ counts.compares ?? 0 }}
+        </el-descriptions-item>
+        <el-descriptions-item label="大断面成果 / 挂靠">
+          {{ counts.surveyResults ?? 0 }} / {{ counts.scourLinks ?? 0 }}
         </el-descriptions-item>
         <el-descriptions-item label="最近备份时间">
           {{ lastBackupAt ? new Date(lastBackupAt).toLocaleString('zh-CN') : '尚未备份' }}

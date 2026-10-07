@@ -5,10 +5,12 @@
  */
 import { computed, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { DataLine, Files, Histogram, Odometer, PieChart, TrendCharts } from '@element-plus/icons-vue'
+import { Connection, Odometer, PieChart, TrendCharts } from '@element-plus/icons-vue'
 import { useStationStore } from '@/stores/stationStore'
 import { useSectionStore } from '@/stores/sectionStore'
 import { useRatingStore } from '@/stores/ratingStore'
+import { useSurveyStore } from '@/stores/surveyStore'
+import { useScourStore } from '@/stores/scourStore'
 import { DB_NAME, DB_VERSION } from '@/utils/db'
 
 const route = useRoute()
@@ -16,23 +18,35 @@ const router = useRouter()
 const stationStore = useStationStore()
 const sectionStore = useSectionStore()
 const ratingStore = useRatingStore()
+const surveyStore = useSurveyStore()
+const scourStore = useScourStore()
 
 onMounted(() => {
   stationStore.start()
   sectionStore.start()
   ratingStore.start()
+  surveyStore.start()
+  scourStore.start()
 })
 
 /** 层级路由统一归属到最上层导航项 */
 const activeKey = computed(() => {
-  if (route.path.startsWith('/stations/')) return '/stations'
+  if (route.path.startsWith('/scour-pending')) return '/scour-pending'
+  if (route.path.startsWith('/stations/') && !route.path.includes('/surveys')) return '/stations'
   if (route.path.startsWith('/sections/')) return '/stations'
   if (route.path.startsWith('/verticals/')) return '/stations'
+  if (route.path.includes('/surveys')) return '/scour-pending'
   return route.path
 })
 
 const navItems = computed(() => [
   { key: '/stations', label: '测站台账', icon: Odometer, badge: String(stationStore.stations.length) },
+  {
+    key: '/scour-pending',
+    label: '成果与冲淤对账',
+    icon: Connection,
+    badge: scourStore.stats.pending > 0 ? String(scourStore.stats.pending) : ''
+  },
   { key: '/ratings', label: '关系点据与定线', icon: TrendCharts, badge: String(ratingStore.ratings.length) },
   { key: '/export', label: '比测与导出', icon: PieChart, badge: String(ratingStore.overLimitRows.length) }
 ])
@@ -41,17 +55,26 @@ const navItems = computed(() => [
 const contextLinks = computed(() => {
   const links: Array<{ label: string; path: string }> = []
   const stationId = route.params.id as string | undefined
-  if (route.path.startsWith('/stations/') && stationId) {
+  if (route.path.startsWith('/stations/') && stationId && !route.path.includes('/surveys')) {
     links.push({ label: '该站断面测次', path: `/stations/${stationId}/sections` })
+    links.push({ label: '该站大断面成果', path: `/stations/${stationId}/surveys` })
+  }
+  if (route.path.includes('/surveys') && stationId) {
+    links.push({ label: '该站断面测次', path: `/stations/${stationId}/sections` })
+    links.push({ label: '待挂成果队列', path: '/scour-pending' })
   }
   if (route.path.startsWith('/sections/') && stationId) {
     const section = sectionStore.sectionById(stationId)
     if (section) links.push({ label: '所属测站断面', path: `/stations/${section.stationId}/sections` })
     links.push({ label: '该断面垂线', path: `/sections/${stationId}/verticals` })
+    links.push({ label: '汛后冲淤对账', path: `/sections/${stationId}/scour` })
   }
   if (route.path.startsWith('/verticals/') && stationId) {
     const vertical = sectionStore.verticals.find((item) => item.id === stationId)
-    if (vertical) links.push({ label: '所属断面垂线', path: `/sections/${vertical.sectionId}/verticals` })
+    if (vertical) {
+      links.push({ label: '所属断面垂线', path: `/sections/${vertical.sectionId}/verticals` })
+      links.push({ label: '汛后冲淤对账', path: `/sections/${vertical.sectionId}/scour` })
+    }
   }
   if (route.path.startsWith('/ratings')) links.push({ label: '比测分析', path: '/export' })
   if (route.path.startsWith('/export')) links.push({ label: '关系点据', path: '/ratings' })
@@ -61,6 +84,7 @@ const contextLinks = computed(() => {
 function go(path: string): void {
   void router.push(path)
 }
+
 </script>
 
 <template>
@@ -116,7 +140,8 @@ function go(path: string): void {
       <span>
         测站 {{ stationStore.stations.length }} · 测次 {{ sectionStore.sections.length }} · 垂线
         {{ sectionStore.verticals.length }} · 测点 {{ sectionStore.points.length }} · 点据
-        {{ ratingStore.ratings.length }}
+        {{ ratingStore.ratings.length }} · 大断面成果 {{ surveyStore.surveys.length }} ·
+        待挂 {{ scourStore.stats.pending }} / 冲淤偏差 {{ scourStore.stats.deviation }}
       </span>
     </footer>
   </div>
