@@ -13,6 +13,8 @@ import EmptyPanel from '@/components/common/EmptyPanel.vue'
 import { useRatingStore } from '@/stores/ratingStore'
 import { useStationStore } from '@/stores/stationStore'
 import { useSectionStore } from '@/stores/sectionStore'
+import { useSurveyStore } from '@/stores/surveyStore'
+import { buildSiltRows, SILT_LIMIT_M, type SiltRow } from '@/types/survey'
 import {
   DB_NAME,
   DB_VERSION,
@@ -37,6 +39,7 @@ import { fitPowerCurve } from '@/types/rating'
 const ratingStore = useRatingStore()
 const stationStore = useStationStore()
 const sectionStore = useSectionStore()
+const surveyStore = useSurveyStore()
 
 const counts = ref<Record<string, number>>({})
 const lastBackupAt = ref<string | null>(null)
@@ -48,6 +51,38 @@ const exporting = ref(false)
 
 const compareRows = computed(() => ratingStore.compareRows)
 const overLimitRows = computed(() => ratingStore.overLimitRows)
+
+/** 冲淤对账行（带测站与测次上下文）：全部已挂测次逐垂线比对的结果 */
+interface SiltRowView extends SiltRow {
+  stationName: string
+  measureNo: string
+  surveyedAt: string
+}
+
+const siltRows = computed<SiltRowView[]>(() =>
+  sectionStore.sections.flatMap((section) => {
+    if (section.linkStatus !== '已挂' || !section.surveyId) return []
+    const survey = surveyStore.surveyById(section.surveyId)
+    if (!survey) return []
+    const stationName = stationStore.stationById(section.stationId)?.name ?? '未知测站'
+    return buildSiltRows(sectionStore.verticalsOfSection(section.id), survey, section.stageM).map((row) => ({
+      ...row,
+      stationName,
+      measureNo: section.measureNo,
+      surveyedAt: survey.surveyedAt
+    }))
+  })
+)
+
+const siltOverLimitRows = computed(() => siltRows.value.filter((row) => row.overLimit))
+
+/** 待挂测次单列：升级补不上成果的与作废退回的都在这里 */
+const pendingSections = computed(() =>
+  surveyStore.pendingSections.map((section) => ({
+    section,
+    stationName: stationStore.stationById(section.stationId)?.name ?? '未知测站'
+  }))
+)
 
 /** 检测结论：按测站汇总测次、最新水位、定线参数与超限点据 */
 const conclusions = ref<
@@ -180,7 +215,21 @@ onMounted(() => {
     <div class="gb-stats-row">
       <StatBadge label="测站" :value="counts.stations ?? 0" suffix="站" icon="Odometer" />
       <StatBadge label="断面测次" :value="counts.sections ?? 0" suffix="次" icon="Files" tone="info" />
-      <StatBadge label="流速测点" :value="counts.points ?? 0" suffix="点" icon="DataLine" tone="success" />
+      <StatBadge label="大断面成果" :value="counts.surveys ?? 0" suffix="份" icon="Histogram" tone="primary" />
+      <StatBadge
+        label="冲淤偏差"
+        :value="siltOverLimitRows.length"
+        suffix="条"
+        :tone="siltOverLimitRows.length > 0 ? 'danger' : 'success'"
+        icon="WarningFilled"
+      />
+      <StatBadge
+        label="待挂测次"
+        :value="pendingSections.length"
+        suffix="次"
+        :tone="pendingSections.length > 0 ? 'warning' : 'primary'"
+        icon="DataLine"
+      />
       <StatBadge
         label="比测合格率"
         :value="ratingStore.fitQuality.qualifyRatePct"
@@ -288,9 +337,111 @@ onMounted(() => {
 
     <el-card shadow="never" class="gb-panel">
       <div class="gb-panel-title">
+        <h3>
+          冲淤偏差分析清单
+          <el-tag v-if="siltOverLimitRows.length > 0" type="danger" size="small" effect="plain">
+            <el-icon><Warning /></el-icon> {{ siltOverLimitRows.length }} 条超限
+          </el-tag>
+        </h3>
+        <span class="gb-hint">
+          差值 = 实测水深 −（水位 − 成果河底高程），限值 {{ SILT_LIMIT_M }} m；实测水深照旧算流量，河底高程只判偏差
+        </span>
+      </div>
+
+      <EmptyPanel
+        v-if="siltRows.length === 0"
+        title="还没有已挂测次"
+        description="测次挂上当时生效的大断面成果后，这里逐垂线列出冲淤对账结果。"
+        compact
+      />
+      <EmptyPanel
+        v-else-if="siltOverLimitRows.length === 0"
+        title="全部垂线对账正常"
+        :description="`共对账 ${siltRows.length} 条垂线，差值均在限值 ${SILT_LIMIT_M} m 以内。`"
+        compact
+      />
+
+      <el-table v-else :data="siltOverLimitRows" border stripe class="gb-table-compact">
+        <el-table-column prop="stationName" label="测站" min-width="120" />
+        <el-table-column prop="measureNo" label="测次号" min-width="130" />
+        <el-table-column label="成果施测" width="110">
+          <template #default="{ row }">
+            <span class="gb-mono">{{ new Date(row.surveyedAt).toLocaleDateString('zh-CN') }}</span>
+          </template>
+        </el-table-column>
+        <el-table-column prop="no" label="垂线号" width="80" align="center" />
+        <el-table-column label="起点距 (m)" width="100" align="right">
+          <template #default="{ row }">
+            <span class="gb-mono">{{ row.startDistanceM.toFixed(1) }}</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="实测水深 (m)" width="110" align="right">
+          <template #default="{ row }">
+            <span class="gb-mono">{{ row.measuredDepthM.toFixed(2) }}</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="折算水深 (m)" width="110" align="right">
+          <template #default="{ row }">
+            <span class="gb-mono">{{ row.expectedDepthM.toFixed(2) }}</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="差值 (m)" width="100" align="right">
+          <template #default="{ row }">
+            <span class="gb-mono page__danger">{{ row.diffM > 0 ? '+' : '' }}{{ row.diffM.toFixed(2) }}</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="判定" width="100" align="center">
+          <template #default>
+            <el-tag size="small" type="danger" effect="plain">冲淤偏差</el-tag>
+          </template>
+        </el-table-column>
+      </el-table>
+    </el-card>
+
+    <el-card shadow="never" class="gb-panel">
+      <div class="gb-panel-title">
+        <h3>
+          待挂测次单列
+          <el-tag v-if="pendingSections.length > 0" type="warning" size="small" effect="plain">
+            {{ pendingSections.length }} 次待挂
+          </el-tag>
+        </h3>
+        <span class="gb-hint">升级补不上成果的、测次时间改动后作废退回的测次在此单列，重挂在断面测次页进行</span>
+      </div>
+
+      <EmptyPanel
+        v-if="pendingSections.length === 0"
+        title="没有待挂测次"
+        description="全部测次均已挂上当时生效的大断面成果。"
+        compact
+      />
+
+      <el-table v-else :data="pendingSections" border stripe class="gb-table-compact">
+        <el-table-column prop="stationName" label="测站" min-width="130" />
+        <el-table-column prop="section.measureNo" label="测次号" min-width="140" />
+        <el-table-column label="测法" width="100" align="center">
+          <template #default="{ row }">
+            <el-tag size="small" effect="plain">{{ row.section.method }}</el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="水位 (m)" width="100" align="right">
+          <template #default="{ row }">
+            <span class="gb-mono">{{ row.section.stageM.toFixed(2) }}</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="测流时间" min-width="160">
+          <template #default="{ row }">
+            <span class="gb-mono">{{ new Date(row.section.measuredAt).toLocaleString('zh-CN') }}</span>
+          </template>
+        </el-table-column>
+      </el-table>
+    </el-card>
+
+    <el-card shadow="never" class="gb-panel">
+      <div class="gb-panel-title">
         <h3>全量 JSON 导入导出</h3>
         <span class="gb-hint">
-          导出内容包含 stations / sections / verticals / points / ratings / compares 六张表
+          导出内容包含 stations / sections / verticals / points / ratings / compares / surveys 七张表
         </span>
       </div>
 
@@ -333,6 +484,9 @@ onMounted(() => {
         </el-descriptions-item>
         <el-descriptions-item label="点据 / 比测">
           {{ counts.ratings ?? 0 }} / {{ counts.compares ?? 0 }}
+        </el-descriptions-item>
+        <el-descriptions-item label="大断面成果 / 待挂测次">
+          {{ counts.surveys ?? 0 }} / {{ pendingSections.length }}
         </el-descriptions-item>
         <el-descriptions-item label="最近备份时间">
           {{ lastBackupAt ? new Date(lastBackupAt).toLocaleString('zh-CN') : '尚未备份' }}

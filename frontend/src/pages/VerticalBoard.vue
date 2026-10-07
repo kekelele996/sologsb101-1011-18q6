@@ -13,7 +13,9 @@ import EmptyPanel from '@/components/common/EmptyPanel.vue'
 import RouteMissingPanel from '@/components/common/RouteMissingPanel.vue'
 import { useStationStore } from '@/stores/stationStore'
 import { useSectionStore } from '@/stores/sectionStore'
+import { useSurveyStore } from '@/stores/surveyStore'
 import { buildRelativeDepths, type Vertical } from '@/types/vertical'
+import { buildSiltRows, countSiltOverLimit, SILT_LIMIT_M, type SiltRow } from '@/types/survey'
 import { calcMeanVelocity, calcSectionDischarge } from '@/utils/flow'
 import { initDatabase } from '@/utils/db'
 
@@ -21,10 +23,18 @@ const route = useRoute()
 const router = useRouter()
 const stationStore = useStationStore()
 const sectionStore = useSectionStore()
+const surveyStore = useSurveyStore()
 
 const sectionId = computed(() => String(route.params.id ?? ''))
 const section = computed(() => sectionStore.sectionById(sectionId.value))
 const station = computed(() => (section.value ? stationStore.stationById(section.value.stationId) : null))
+
+/** 测次挂靠的大断面成果（待挂或成果被删时为 null） */
+const linkedSurvey = computed(() => {
+  const current = section.value
+  if (!current || current.linkStatus !== '已挂' || !current.surveyId) return null
+  return surveyStore.surveyById(current.surveyId)
+})
 
 const dialogVisible = ref(false)
 const editingId = ref<string | null>(null)
@@ -68,6 +78,25 @@ const stats = computed(() => ({
   maxDepthM: verticals.value.length ? Math.max(...verticals.value.map((item) => item.depthM)) : 0,
   widthM: discharge.value.widthM
 }))
+
+/**
+ * 冲淤对账：拿垂线起点距与实测水深，跟成果同起点距河底高程
+ * 按水位折算的水深逐条对；实测水深照旧算流量，河底高程只判偏差。
+ */
+const siltRows = computed<SiltRow[]>(() => {
+  if (!linkedSurvey.value || !section.value) return []
+  return buildSiltRows(verticals.value, linkedSurvey.value, section.value.stageM)
+})
+
+const siltByVerticalId = computed<Record<string, SiltRow>>(() => {
+  const map: Record<string, SiltRow> = {}
+  siltRows.value.forEach((row) => {
+    map[row.verticalId] = row
+  })
+  return map
+})
+
+const siltOverLimitCount = computed(() => countSiltOverLimit(siltRows.value))
 
 function nextNo(): number {
   const numbers = verticals.value.map((vertical) => vertical.no)
@@ -234,6 +263,26 @@ onMounted(() => {
         :title="`起点距排序校验未通过：垂线 ${conflicts.join('、')} 的起点距与其他垂线重复，请调整后再参与流量计算`"
       />
 
+      <el-alert
+        v-if="section.linkStatus !== '已挂'"
+        type="info"
+        show-icon
+        :closable="false"
+        title="该测次尚未挂靠大断面成果（待挂），请先在断面测次页完成挂靠后再对账冲淤偏差"
+      />
+      <el-alert
+        v-else-if="linkedSurvey"
+        :type="siltOverLimitCount > 0 ? 'warning' : 'success'"
+        show-icon
+        :closable="false"
+        :title="
+          siltOverLimitCount > 0
+            ? `已挂 ${new Date(linkedSurvey.surveyedAt).toLocaleDateString('zh-CN')} 成果：${siltOverLimitCount} 条垂线冲淤偏差超限（限值 ${SILT_LIMIT_M} m），断面流量与比测结论已跟着重算`
+            : `已挂 ${new Date(linkedSurvey.surveyedAt).toLocaleDateString('zh-CN')} 成果：全部垂线冲淤偏差在限值 ${SILT_LIMIT_M} m 以内`
+        "
+        description="实测水深照旧参与流量计算，成果河底高程只用于冲淤偏差判定"
+      />
+
       <EmptyPanel
         v-if="verticalRows.length === 0"
         title="该测次还没有垂线"
@@ -257,6 +306,33 @@ onMounted(() => {
         <el-table-column label="水深 (m)" width="110" align="right">
           <template #default="{ row }">
             <span class="gb-mono">{{ row.vertical.depthM.toFixed(2) }}</span>
+          </template>
+        </el-table-column>
+        <el-table-column v-if="linkedSurvey" label="折算水深 (m)" width="120" align="right">
+          <template #default="{ row }">
+            <span class="gb-mono">{{ siltByVerticalId[row.vertical.id]?.expectedDepthM.toFixed(2) ?? '—' }}</span>
+          </template>
+        </el-table-column>
+        <el-table-column v-if="linkedSurvey" label="差值 (m)" width="110" align="right">
+          <template #default="{ row }">
+            <span
+              class="gb-mono"
+              :class="{ page__danger: siltByVerticalId[row.vertical.id]?.overLimit }"
+            >
+              {{ siltByVerticalId[row.vertical.id] ? `${siltByVerticalId[row.vertical.id].diffM > 0 ? '+' : ''}${siltByVerticalId[row.vertical.id].diffM.toFixed(2)}` : '—' }}
+            </span>
+          </template>
+        </el-table-column>
+        <el-table-column v-if="linkedSurvey" label="冲淤判定" width="110" align="center">
+          <template #default="{ row }">
+            <el-tag
+              v-if="siltByVerticalId[row.vertical.id]"
+              size="small"
+              :type="siltByVerticalId[row.vertical.id].overLimit ? 'danger' : 'success'"
+              effect="plain"
+            >
+              {{ siltByVerticalId[row.vertical.id].overLimit ? '冲淤偏差' : '正常' }}
+            </el-tag>
           </template>
         </el-table-column>
         <el-table-column label="测点数" width="100" align="center">
@@ -385,5 +461,10 @@ onMounted(() => {
   margin-left: 4px;
   color: #d68910;
   vertical-align: middle;
+}
+
+.page__danger {
+  color: #c0392b;
+  font-weight: 700;
 }
 </style>

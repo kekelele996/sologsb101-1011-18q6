@@ -9,6 +9,7 @@ import { DataLine, Files, Histogram, Odometer, PieChart, TrendCharts } from '@el
 import { useStationStore } from '@/stores/stationStore'
 import { useSectionStore } from '@/stores/sectionStore'
 import { useRatingStore } from '@/stores/ratingStore'
+import { useSurveyStore } from '@/stores/surveyStore'
 import { DB_NAME, DB_VERSION } from '@/utils/db'
 
 const route = useRoute()
@@ -16,11 +17,13 @@ const router = useRouter()
 const stationStore = useStationStore()
 const sectionStore = useSectionStore()
 const ratingStore = useRatingStore()
+const surveyStore = useSurveyStore()
 
 onMounted(() => {
   stationStore.start()
   sectionStore.start()
   ratingStore.start()
+  surveyStore.start()
 })
 
 /** 层级路由统一归属到最上层导航项 */
@@ -43,6 +46,7 @@ const contextLinks = computed(() => {
   const stationId = route.params.id as string | undefined
   if (route.path.startsWith('/stations/') && stationId) {
     links.push({ label: '该站断面测次', path: `/stations/${stationId}/sections` })
+    links.push({ label: '该站大断面成果', path: `/stations/${stationId}/surveys` })
   }
   if (route.path.startsWith('/sections/') && stationId) {
     const section = sectionStore.sectionById(stationId)
@@ -116,7 +120,8 @@ function go(path: string): void {
       <span>
         测站 {{ stationStore.stations.length }} · 测次 {{ sectionStore.sections.length }} · 垂线
         {{ sectionStore.verticals.length }} · 测点 {{ sectionStore.points.length }} · 点据
-        {{ ratingStore.ratings.length }}
+        {{ ratingStore.ratings.length }} · 成果 {{ surveyStore.surveys.length }} · 待挂
+        {{ surveyStore.pendingSections.length }}
       </span>
     </footer>
   </div>

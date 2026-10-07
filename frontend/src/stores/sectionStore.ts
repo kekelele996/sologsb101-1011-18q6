@@ -179,10 +179,18 @@ export const useSectionStore = defineStore('section', () => {
   /* ------------------------------ 断面测次 ------------------------------ */
 
   async function createSection(
-    payload: Omit<Section, 'id' | 'createdAt' | 'updatedAt'>
+    payload: Omit<Section, 'id' | 'createdAt' | 'updatedAt' | 'surveyId' | 'linkStatus'>
   ): Promise<Section> {
     const now = Date.now()
-    const row: Section = { ...payload, id: createId('sec'), createdAt: now, updatedAt: now }
+    // 新测次默认待挂，由流量测验组在测次列表侧挂靠当时生效的大断面成果
+    const row: Section = {
+      ...payload,
+      surveyId: null,
+      linkStatus: '待挂',
+      id: createId('sec'),
+      createdAt: now,
+      updatedAt: now
+    }
     await db.sections.put(row)
     return row
   }

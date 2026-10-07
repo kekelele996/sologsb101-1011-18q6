@@ -2,7 +2,8 @@ import { createRouter, createWebHistory, type RouteRecordRaw } from 'vue-router'
 
 /**
  * 路由表：路径与提示词逐字一致。
- * /stations、/stations/:id/sections、/sections/:id/verticals、/verticals/:id/points、/ratings、/export
+ * /stations、/stations/:id/sections、/stations/:id/surveys、/sections/:id/verticals、
+ * /verticals/:id/points、/ratings、/export
  * 全部页面懒加载，构建时自动分包。
  */
 const routes: RouteRecordRaw[] = [
@@ -18,6 +19,12 @@ const routes: RouteRecordRaw[] = [
     name: 'section-list',
     component: () => import('@/pages/SectionList.vue'),
     meta: { title: '断面测次', icon: 'Files' }
+  },
+  {
+    path: '/stations/:id/surveys',
+    name: 'survey-board',
+    component: () => import('@/pages/SurveyBoard.vue'),
+    meta: { title: '大断面成果', icon: 'MapLocation' }
   },
   {
     path: '/sections/:id/verticals',
